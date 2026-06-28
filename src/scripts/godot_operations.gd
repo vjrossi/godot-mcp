@@ -1338,6 +1338,30 @@ func _convert_property_value(node, prop_name, value):
                     return str(value)
                 TYPE_NODE_PATH:
                     return NodePath(str(value))
+                TYPE_OBJECT:
+                    # Resource-typed properties (Shape2D/Shape3D, Texture2D, AudioStream,
+                    # Material, etc.) — previously unhandled here, so a JSON value for one
+                    # of these fell through to the final "return value" below and got
+                    # passed raw to target.set(), which Godot silently no-ops on a type
+                    # mismatch. Confirmed live: a CollisionShape2D's "shape" property never
+                    # actually gets assigned this way, with zero error anywhere — the scene
+                    # still packs and saves "successfully".
+                    if value is String and (value.begins_with("res://") or value.begins_with("user://")):
+                        var loaded = load(value)
+                        if loaded == null:
+                            printerr("Failed to load resource: " + value)
+                        return loaded
+                    if value is Dictionary and value.has("type"):
+                        var res_type = str(value["type"])
+                        if not ClassDB.class_exists(res_type) or not ClassDB.can_instantiate(res_type):
+                            printerr("Cannot instantiate resource type: " + res_type)
+                            return value
+                        var res = ClassDB.instantiate(res_type)
+                        for key in value:
+                            if key == "type":
+                                continue
+                            res.set(key, _convert_property_value(res, key, value[key]))
+                        return res
             break
     return value
 
@@ -1627,6 +1651,11 @@ func attach_script(params):
         return
 
     target.set_script(script)
+
+    if target.get_script() != script:
+        printerr("Failed to attach script: Godot silently rejected the assignment (commonly a C# class/filename case mismatch, or the class is otherwise unresolvable) at: " + full_script_path)
+        _operation_failed = true
+        return
 
     # Repack and save
     var packed_scene = PackedScene.new()

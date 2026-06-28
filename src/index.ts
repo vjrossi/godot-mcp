@@ -919,7 +919,14 @@ class GodotServer {
               },
               properties: {
                 type: 'object',
-                description: 'Optional properties to set on the node',
+                description: 'Optional properties to set on the node. Plain numbers/strings/bools work '
+                  + 'directly. Vector2/Vector3 must be JSON objects {"x":.., "y":.., ["z":..]} — never '
+                  + 'Vector2(x,y)/Vector3(x,y,z) syntax (that\'s GDScript, not valid JSON). Color must be '
+                  + '{"r":..,"g":..,"b":..,"a":..} or a "#RRGGBB" string — never Color(r,g,b,a). '
+                  + 'Resource-typed properties (shape, texture, material, etc.) must be '
+                  + '{"type": "ClassName", ...subProperties} (e.g. {"type":"CircleShape2D","radius":10}) '
+                  + 'or a "res://..." path to an existing resource — never a bare constructor call or '
+                  + 'ExtResource(...) reference.',
               },
             },
             required: ['projectPath', 'scenePath', 'nodeType', 'nodeName'],
@@ -1345,7 +1352,14 @@ class GodotServer {
               },
               properties: {
                 type: 'object',
-                description: 'Properties to set on the node as key-value pairs',
+                description: 'Properties to set on the node as key-value pairs. Plain numbers/strings/bools '
+                  + 'work directly. Vector2/Vector3 must be JSON objects {"x":.., "y":.., ["z":..]} — never '
+                  + 'Vector2(x,y)/Vector3(x,y,z) syntax (that\'s GDScript, not valid JSON). Color must be '
+                  + '{"r":..,"g":..,"b":..,"a":..} or a "#RRGGBB" string — never Color(r,g,b,a). '
+                  + 'Resource-typed properties (shape, texture, material, etc.) must be '
+                  + '{"type": "ClassName", ...subProperties} (e.g. {"type":"CircleShape2D","radius":10}) '
+                  + 'or a "res://..." path to an existing resource — never a bare constructor call or '
+                  + 'ExtResource(...) reference.',
               },
             },
             required: ['projectPath', 'scenePath', 'nodePath', 'properties'],
@@ -1557,6 +1571,22 @@ class GodotServer {
           },
         },
         {
+          name: 'create_scripted_node',
+          description: 'Create/reuse a scene, attach a script (C# filename forced to match class)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Godot project path' },
+              scenePath: { type: 'string', description: 'Scene file path (relative to project). Created if it does not exist.' },
+              rootNodeType: { type: 'string', description: 'Root node type if the scene needs creating. Default: Node2D' },
+              nodePath: { type: 'string', description: 'Node to attach the script to (e.g. "root/Player"). Default: "."' },
+              scriptPath: { type: 'string', description: 'Where to save the script. For .cs, filename is just a suggestion.' },
+              scriptContent: { type: 'string', description: 'Full source of the script to write.' },
+            },
+            required: ['projectPath', 'scenePath', 'scriptPath', 'scriptContent'],
+          },
+        },
+        {
           name: 'create_resource',
           description: 'Create a .tres resource file (headless)',
           inputSchema: {
@@ -1565,7 +1595,13 @@ class GodotServer {
               projectPath: { type: 'string', description: 'Godot project path' },
               resourceType: { type: 'string', description: 'Godot class name (e.g., "StandardMaterial3D", "Theme", "Environment")' },
               resourcePath: { type: 'string', description: 'Where to save the .tres file (relative to project)' },
-              properties: { type: 'object', description: 'Optional properties to set on the resource' },
+              properties: {
+                type: 'object',
+                description: 'Optional properties to set on the resource. Plain numbers/strings/bools work '
+                  + 'directly. Vector2/Vector3 must be JSON objects {"x":.., "y":.., ["z":..]} — never '
+                  + 'Vector2(x,y)/Vector3(x,y,z) syntax (that\'s GDScript, not valid JSON). Color must be '
+                  + '{"r":..,"g":..,"b":..,"a":..} or a "#RRGGBB" string — never Color(r,g,b,a).',
+              },
             },
             required: ['projectPath', 'resourceType', 'resourcePath'],
           },
@@ -2800,7 +2836,13 @@ class GodotServer {
               projectPath: { type: 'string', description: 'Godot project path' },
               resourcePath: { type: 'string', description: 'Resource file path (relative to project)' },
               action: { type: 'string', description: 'Action: read or modify' },
-              properties: { type: 'object', description: 'Properties to modify' },
+              properties: {
+                type: 'object',
+                description: 'Properties to modify. Plain numbers/strings/bools work directly. '
+                  + 'Vector2/Vector3 must be JSON objects {"x":.., "y":.., ["z":..]} — never '
+                  + 'Vector2(x,y)/Vector3(x,y,z) syntax (that\'s GDScript, not valid JSON). Color must be '
+                  + '{"r":..,"g":..,"b":..,"a":..} or a "#RRGGBB" string — never Color(r,g,b,a).',
+              },
             },
             required: ['projectPath', 'resourcePath', 'action'],
           },
@@ -3300,6 +3342,8 @@ class GodotServer {
         // Headless resource tools
         case 'attach_script':
           return await this.handleAttachScript(request.params.arguments);
+        case 'create_scripted_node':
+          return await this.handleCreateScriptedNode(request.params.arguments);
         case 'create_resource':
           return await this.handleCreateResource(request.params.arguments);
         // File I/O tools
@@ -4913,10 +4957,89 @@ class GodotServer {
     args = normalizeParameters(args || {});
     if (!args.projectPath || !args.scenePath || !args.nodePath || !args.scriptPath)
       return createErrorResponse('projectPath, scenePath, nodePath, and scriptPath are required.');
+
+    if (args.scriptPath.toLowerCase().endsWith('.cs')) {
+      const fullScriptPath = join(args.projectPath, args.scriptPath);
+      if (existsSync(fullScriptPath)) {
+        const content = readFileSync(fullScriptPath, 'utf8');
+        const match = /\bclass\s+(\w+)/.exec(content);
+        const lastSlash = args.scriptPath.lastIndexOf('/');
+        const fileBaseName = args.scriptPath.slice(lastSlash + 1, -3); // strip dir and ".cs"
+        if (match && match[1] !== fileBaseName) {
+          return createErrorResponse(
+            `Filename/class name case mismatch: "${fileBaseName}.cs" contains class "${match[1]}" — Godot's C# loader requires these to match exactly (case-sensitive), or the script will silently fail to load. Rename the file to "${match[1]}.cs", or use create_scripted_node to do this automatically.`
+          );
+        }
+      }
+    }
+
     return this.headlessOp('attach_script', args, a => ({
       projectPath: a.projectPath,
       params: { scenePath: a.scenePath, nodePath: a.nodePath, scriptPath: a.scriptPath },
     }));
+  }
+
+  private async handleCreateScriptedNode(args: any) {
+    args = normalizeParameters(args || {});
+    if (!args.projectPath || !args.scenePath || !args.scriptPath || args.scriptContent === undefined)
+      return createErrorResponse('projectPath, scenePath, scriptPath, and scriptContent are required.');
+
+    let finalScriptPath = args.scriptPath;
+    let renamed = false;
+    if (args.scriptPath.toLowerCase().endsWith('.cs')) {
+      const match = /\bclass\s+(\w+)/.exec(args.scriptContent);
+      if (!match) {
+        return createErrorResponse('Could not find a C# class declaration (e.g. "public partial class Foo") in scriptContent — refusing to guess a filename.');
+      }
+      const className = match[1];
+      const lastSlash = args.scriptPath.lastIndexOf('/');
+      const dir = lastSlash >= 0 ? args.scriptPath.slice(0, lastSlash + 1) : '';
+      finalScriptPath = `${dir}${className}.cs`;
+      renamed = finalScriptPath !== args.scriptPath;
+    }
+
+    if (!validatePath(args.projectPath) || !validatePath(args.scenePath) || !validatePath(finalScriptPath))
+      return createErrorResponse('Invalid path.');
+
+    const writeResult = await this.handleWriteFile({
+      projectPath: args.projectPath,
+      filePath: finalScriptPath,
+      content: args.scriptContent,
+    });
+    if (writeResult.isError) return writeResult;
+
+    const sceneFull = join(args.projectPath, args.scenePath);
+    let sceneCreated = false;
+    if (!existsSync(sceneFull)) {
+      const createResult = await this.handleCreateScene({
+        projectPath: args.projectPath,
+        scenePath: args.scenePath,
+        rootNodeType: args.rootNodeType,
+      });
+      if (createResult.isError) return createResult;
+      sceneCreated = true;
+    }
+
+    const nodePath = args.nodePath || '.';
+    const attachResult = await this.handleAttachScript({
+      projectPath: args.projectPath,
+      scenePath: args.scenePath,
+      nodePath,
+      scriptPath: finalScriptPath,
+    });
+    if (attachResult.isError) return attachResult;
+
+    const renamedNote = renamed
+      ? ` (renamed from "${args.scriptPath}" to "${finalScriptPath}" to match the C# class name exactly)`
+      : '';
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Created scripted node successfully.\nScene: ${args.scenePath} (${sceneCreated ? 'created' : 'existing'})\nScript: ${finalScriptPath}${renamedNote}\nNode: ${nodePath}\n\n${attachResult.content?.[0]?.text || ''}`,
+        },
+      ],
+    };
   }
 
   private async handleCreateResource(args: any) {
@@ -5222,17 +5345,24 @@ class GodotServer {
   }
 
   private keyNameToScancode(key: string): number {
+    // Values verified live against a real Godot 4.6.1 instance (KEY_* constants printed via
+    // a headless GDScript dump) — the previous table used Godot 3's special-key base
+    // (1 << 24 = 16777216), but Godot 4 moved to 1 << 22 = 4194304. Every non-letter/space
+    // key here (arrows, Enter, Escape, Tab, Backspace, Shift/Ctrl/Alt, F-keys) was wrong as
+    // a result — confirmed live: an action bound to "DOWN" wrote physical_keycode=16777234,
+    // which Godot 4 doesn't recognize as any real key, so the binding silently did nothing
+    // at runtime despite the .add() call reporting success.
     const map: Record<string, number> = {
       'A': 65, 'B': 66, 'C': 67, 'D': 68, 'E': 69, 'F': 70, 'G': 71, 'H': 72,
       'I': 73, 'J': 74, 'K': 75, 'L': 76, 'M': 77, 'N': 78, 'O': 79, 'P': 80,
       'Q': 81, 'R': 82, 'S': 83, 'T': 84, 'U': 85, 'V': 86, 'W': 87, 'X': 88,
-      'Y': 89, 'Z': 90, 'SPACE': 32, 'ENTER': 16777221, 'ESCAPE': 16777217,
-      'TAB': 16777218, 'BACKSPACE': 16777220, 'UP': 16777232, 'DOWN': 16777234,
-      'LEFT': 16777231, 'RIGHT': 16777233, 'SHIFT': 16777237, 'CTRL': 16777238,
-      'ALT': 16777240, 'F1': 16777244, 'F2': 16777245, 'F3': 16777246,
-      'F4': 16777247, 'F5': 16777248, 'F6': 16777249, 'F7': 16777250,
-      'F8': 16777251, 'F9': 16777252, 'F10': 16777253, 'F11': 16777254,
-      'F12': 16777255,
+      'Y': 89, 'Z': 90, 'SPACE': 32, 'ENTER': 4194309, 'ESCAPE': 4194305,
+      'TAB': 4194306, 'BACKSPACE': 4194308, 'UP': 4194320, 'DOWN': 4194322,
+      'LEFT': 4194319, 'RIGHT': 4194321, 'SHIFT': 4194325, 'CTRL': 4194326,
+      'ALT': 4194328, 'F1': 4194332, 'F2': 4194333, 'F3': 4194334,
+      'F4': 4194335, 'F5': 4194336, 'F6': 4194337, 'F7': 4194338,
+      'F8': 4194339, 'F9': 4194340, 'F10': 4194341, 'F11': 4194342,
+      'F12': 4194343,
     };
     const upper = key.toUpperCase();
     return map[upper] || (key.length === 1 ? key.charCodeAt(0) : 0);
