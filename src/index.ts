@@ -570,8 +570,8 @@ class GodotServer {
     if (!existsSync(projectFile)) return createErrorResponse(`Not a valid Godot project: ${projectPath}`);
 
     try {
-      const { stdout, stderr } = await this.executeOperation(operation, params, projectPath);
-      if (stderr && stderr.includes('Failed to')) return createErrorResponse(`${operation} failed: ${stderr}`);
+      const { stdout, stderr, exitCode } = await this.executeOperation(operation, params, projectPath);
+      if (exitCode !== 0) return createErrorResponse(`${operation} failed: ${stderr || stdout}`);
       return { content: [{ type: 'text', text: `${operation} succeeded.\n\nOutput: ${stdout}` }] };
     } catch (error: any) {
       return createErrorResponse(`${operation} failed: ${error?.message || 'Unknown error'}`);
@@ -589,7 +589,7 @@ class GodotServer {
     operation: string,
     params: OperationParams,
     projectPath: string
-  ): Promise<{ stdout: string; stderr: string }> {
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     this.logDebug(`Executing operation: ${operation} in project: ${projectPath}`);
     this.logDebug(`Original operation params: ${JSON.stringify(params)}`);
 
@@ -631,14 +631,21 @@ class GodotServer {
 
       const { stdout, stderr } = await execFileAsync(this.godotPath!, args);
 
-      return { stdout: stdout ?? '', stderr: stderr ?? '' };
+      return { stdout: stdout ?? '', stderr: stderr ?? '', exitCode: 0 };
     } catch (error: unknown) {
-      // If execFileAsync throws, it still contains stdout/stderr
+      // execFileAsync rejects on a nonzero exit code (or signal) — it still carries
+      // stdout/stderr/code. Surfacing the real exit code here, instead of discarding
+      // it, is the authoritative signal: the GDScript side emits dozens of distinct
+      // printerr() messages on real failure (e.g. "Parent node not found: ...",
+      // "Unknown manage_scene_structure action: ..."), most of which don't contain
+      // "Failed to" — so every call site that tried to detect failure via a stderr
+      // substring match was silently reporting success on those cases.
       if (error instanceof Error && 'stdout' in error && 'stderr' in error) {
-        const execError = error as Error & { stdout: string; stderr: string };
+        const execError = error as Error & { stdout: string; stderr: string; code?: number; signal?: string };
         return {
           stdout: execError.stdout ?? '',
           stderr: execError.stderr ?? '',
+          exitCode: typeof execError.code === 'number' ? execError.code : 1,
         };
       }
 
@@ -1738,6 +1745,7 @@ class GodotServer {
               action: { type: 'string', description: '"list", "add", or "remove"' },
               actionName: { type: 'string', description: 'Input action name (required for add/remove)' },
               key: { type: 'string', description: 'Key to bind (for add, e.g. "W", "Space")' },
+              keys: { type: 'array', items: { type: 'string' }, description: 'Multiple keys to bind in one add call, e.g. ["W", "Up"]' },
               deadzone: { type: 'number', description: 'Deadzone for the action. Default: 0.5' },
             },
             required: ['projectPath', 'action'],
@@ -4035,9 +4043,9 @@ class GodotServer {
       };
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('create_scene', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('create_scene', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to create scene: ${stderr}`
         );
@@ -4111,9 +4119,9 @@ class GodotServer {
       }
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('add_node', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('add_node', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to add node: ${stderr}`
         );
@@ -4191,9 +4199,9 @@ class GodotServer {
       };
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('load_sprite', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('load_sprite', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to load sprite: ${stderr}`
         );
@@ -4266,9 +4274,9 @@ class GodotServer {
       }
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('export_mesh_library', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('export_mesh_library', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to export mesh library: ${stderr}`
         );
@@ -4343,9 +4351,9 @@ class GodotServer {
       }
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('save_scene', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('save_scene', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to save scene: ${stderr}`
         );
@@ -4429,9 +4437,9 @@ class GodotServer {
       };
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('get_uid', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('get_uid', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to get UID: ${stderr}`
         );
@@ -5160,10 +5168,37 @@ class GodotServer {
         if (!args.actionName)
           return createErrorResponse('actionName is required for add action.');
         const deadzone = args.deadzone !== undefined ? args.deadzone : 0.5;
-        let events = '';
-        if (args.key) {
-          events = `, "events": [Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,"keycode":0,"physical_keycode":${this.keyNameToScancode(args.key)},"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)]`;
+        // Accept either a single args.key or multiple args.keys -- binding more than one
+        // key to the same action (e.g. WASD + arrows both mapped to move_up) is the
+        // common case, not the exception.
+        const keys: string[] = args.keys ? args.keys : (args.key ? [args.key] : []);
+        const newEvents = keys.map(key =>
+          `Object(InputEventKey,"resource_local_to_scene":false,"resource_name":"","device":-1,"window_id":0,"alt_pressed":false,"shift_pressed":false,"ctrl_pressed":false,"meta_pressed":false,"pressed":false,"keycode":0,"physical_keycode":${this.keyNameToScancode(key)},"key_label":0,"unicode":0,"location":0,"echo":false,"script":null)`
+        );
+
+        const escapedName = args.actionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const existingLinePattern = new RegExp(`^${escapedName}=\\{.*\\}$`, 'm');
+        const existingMatch = content.match(existingLinePattern);
+
+        if (existingMatch) {
+          // Action already exists -- merge the new key(s) into its existing events array
+          // instead of appending a second, duplicate "actionName=..." line (the original
+          // bug: repeated add calls for the same action produced duplicate lines that
+          // Godot's .cfg parser doesn't merge, silently dropping all but one binding).
+          let line = existingMatch[0];
+          if (newEvents.length > 0) {
+            if (line.includes('"events"')) {
+              line = line.replace(/"events":\s*\[/, `"events": [${newEvents.join(', ')}, `);
+            } else {
+              line = line.replace(/\}$/, `, "events": [${newEvents.join(', ')}]}`);
+            }
+          }
+          content = content.replace(existingLinePattern, line);
+          writeFileSync(projectFile, content, 'utf8');
+          return { content: [{ type: 'text', text: `Input action "${args.actionName}" updated with ${newEvents.length} additional key(s).` }] };
         }
+
+        const events = newEvents.length > 0 ? `, "events": [${newEvents.join(', ')}]` : '';
         const inputLine = `${args.actionName}={"deadzone": ${deadzone}${events}}`;
         if (content.includes('[input]')) {
           content = content.replace('[input]', `[input]\n\n${inputLine}`);
@@ -6612,9 +6647,9 @@ class GodotServer {
       };
 
       // Execute the operation
-      const { stdout, stderr } = await this.executeOperation('resave_resources', params, args.projectPath);
+      const { stdout, stderr, exitCode } = await this.executeOperation('resave_resources', params, args.projectPath);
 
-      if (stderr && stderr.includes('Failed to')) {
+      if (exitCode !== 0) {
         return createErrorResponse(
           `Failed to update project UIDs: ${stderr}`
         );
