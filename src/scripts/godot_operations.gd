@@ -1877,6 +1877,11 @@ func manage_theme_resource(params):
         return
 
 
+func _set_owner_recursive(node: Node, owner: Node) -> void:
+    node.owner = owner
+    for child in node.get_children():
+        _set_owner_recursive(child, owner)
+
 func manage_scene_structure(params):
     var scene_path = params.get("scene_path", "")
     var action = params.get("action", "rename")
@@ -1888,6 +1893,87 @@ func manage_scene_structure(params):
     if not ResourceLoader.exists(full_path):
         printerr("Scene not found: " + full_path)
         _operation_failed = true
+        return
+
+    if action == "reorder" or action == "duplicate" or action == "move":
+        var loaded_scene = load(full_path)
+        if not loaded_scene:
+            printerr("Failed to load scene: " + full_path)
+            _operation_failed = true
+            return
+        var scene_root = loaded_scene.instantiate()
+
+        var resolved_node_path = node_path_str
+        if resolved_node_path.begins_with("root/"):
+            resolved_node_path = resolved_node_path.substr(5)
+
+        var target = scene_root
+        if resolved_node_path != "root" and resolved_node_path != ".":
+            target = scene_root.get_node_or_null(resolved_node_path)
+
+        if target == null:
+            printerr("Node not found: " + node_path_str)
+            _operation_failed = true
+            return
+        if target == scene_root:
+            printerr("Cannot %s the root node of a scene" % action)
+            _operation_failed = true
+            return
+
+        if action == "reorder":
+            var parent = target.get_parent()
+            if not params.has("new_index"):
+                printerr("new_index is required for reorder")
+                _operation_failed = true
+                return
+            var new_index = clampi(int(params.get("new_index")), 0, parent.get_child_count() - 1)
+            var old_index = target.get_index()
+            parent.move_child(target, new_index)
+            print("Node '%s' reordered: index %d -> %d" % [node_path_str, old_index, new_index])
+        elif action == "duplicate":
+            var dup = target.duplicate()
+            dup.name = target.name
+            target.get_parent().add_child(dup, true)
+            _set_owner_recursive(dup, scene_root)
+            print("Node '%s' duplicated as '%s'" % [node_path_str, dup.name])
+        elif action == "move":
+            var new_parent_path = params.get("new_parent_path", "")
+            if new_parent_path.is_empty():
+                printerr("new_parent_path is required for move")
+                _operation_failed = true
+                return
+            var resolved_parent_path = new_parent_path
+            if resolved_parent_path.begins_with("root/"):
+                resolved_parent_path = resolved_parent_path.substr(5)
+            var new_parent = scene_root
+            if resolved_parent_path != "root" and resolved_parent_path != ".":
+                new_parent = scene_root.get_node_or_null(resolved_parent_path)
+            if new_parent == null:
+                printerr("New parent node not found: " + new_parent_path)
+                _operation_failed = true
+                return
+            if new_parent == target or target.is_ancestor_of(new_parent):
+                printerr("Cannot move a node to be a child of its own descendant")
+                _operation_failed = true
+                return
+            var old_parent = target.get_parent()
+            _set_owner_recursive(target, null)
+            old_parent.remove_child(target)
+            new_parent.add_child(target, true)
+            _set_owner_recursive(target, scene_root)
+            print("Node '%s' moved to parent '%s'" % [node_path_str, new_parent_path])
+
+        var packed_scene = PackedScene.new()
+        var result = packed_scene.pack(scene_root)
+        if result != OK:
+            printerr("Failed to pack scene after %s: %s" % [action, str(result)])
+            _operation_failed = true
+            return
+        var save_error = ResourceSaver.save(packed_scene, full_path)
+        if save_error != OK:
+            printerr("Failed to save scene after %s: %s" % [action, str(save_error)])
+            _operation_failed = true
+            return
         return
 
     var scene = ResourceLoader.load(full_path) as PackedScene
@@ -1913,11 +1999,6 @@ func manage_scene_structure(params):
         file.store_string(content)
         file.close()
         print("Node renamed from '%s' to '%s'" % [old_name, new_name])
-    elif action == "duplicate":
-        print("Scene structure duplicated (node: %s)" % node_path_str)
-    elif action == "move":
-        var new_parent_path = params.get("new_parent_path", "")
-        print("Node moved: %s -> parent %s" % [node_path_str, new_parent_path])
     else:
         printerr("Unknown manage_scene_structure action: " + action)
         _operation_failed = true

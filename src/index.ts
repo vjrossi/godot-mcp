@@ -2857,7 +2857,7 @@ class GodotServer {
               scriptPath: { type: 'string', description: 'Script file path (relative to project)' },
               extends: { type: 'string', description: 'Base class to extend. Default: Node' },
               className: { type: 'string', description: 'Optional class_name' },
-              methods: { type: 'array', description: 'Method stubs to include' },
+              methods: { type: 'array', items: { type: 'string' }, description: 'Method stubs to include' },
               source: { type: 'string', description: 'Full source code (overrides template)' },
             },
             required: ['projectPath', 'scriptPath'],
@@ -2951,16 +2951,17 @@ class GodotServer {
         },
         {
           name: 'manage_scene_structure',
-          description: 'Rename/duplicate/move nodes within .tscn scenes',
+          description: 'Rename/duplicate/move/reorder nodes within .tscn scenes',
           inputSchema: {
             type: 'object',
             properties: {
               projectPath: { type: 'string', description: 'Godot project path' },
               scenePath: { type: 'string', description: 'Scene file path (relative to project)' },
-              action: { type: 'string', description: 'Action: rename, duplicate, move' },
+              action: { type: 'string', description: 'Action: rename, duplicate, move, reorder' },
               nodePath: { type: 'string', description: 'Source node path in scene' },
               newName: { type: 'string', description: 'New name (for rename)' },
               newParentPath: { type: 'string', description: 'New parent path (for move)' },
+              newIndex: { type: 'number', description: 'Target 0-based index among siblings (for reorder)' },
             },
             required: ['projectPath', 'scenePath', 'action', 'nodePath'],
           },
@@ -6447,6 +6448,7 @@ class GodotServer {
         scenePath: a.scenePath, action: a.action, nodePath: a.nodePath,
         ...(a.newName ? { newName: a.newName } : {}),
         ...(a.newParentPath ? { newParentPath: a.newParentPath } : {}),
+        ...(a.newIndex !== undefined ? { newIndex: a.newIndex } : {}),
       },
     }));
   }
