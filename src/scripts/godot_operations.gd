@@ -571,9 +571,14 @@ func add_node(params):
             print("Setting properties on node")
         var properties = params.properties
         for property in properties:
+            # Route through the same type converter modify_node uses — setting raw JSON
+            # values directly (a Dictionary for a Vector2/Color, a res:// string or
+            # {"type":...} dict for a Resource-typed property) silently no-ops on Godot's
+            # type mismatch, with no error and the scene still "saves successfully".
+            var converted_value = _convert_property_value(new_node, property, properties[property])
             if debug_mode:
-                print("Setting property: " + property + " = " + str(properties[property]))
-            new_node.set(property, properties[property])
+                print("Setting property: " + property + " = " + str(converted_value) + " (from " + str(properties[property]) + ")")
+            new_node.set(property, converted_value)
     
     parent.add_child(new_node)
     new_node.owner = scene_root
@@ -599,12 +604,15 @@ func add_node(params):
                     print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
                 else:
                     printerr("File reported as saved but does not exist at: " + absolute_scene_path)
+                    _operation_failed = true
             else:
                 print("Node '" + params.node_name + "' of type '" + params.node_type + "' added successfully")
         else:
             printerr("Failed to save scene: " + str(save_error))
+            _operation_failed = true
     else:
         printerr("Failed to pack scene: " + str(result))
+        _operation_failed = true
 
 # Load a sprite into a Sprite2D node
 func load_sprite(params):
@@ -1244,12 +1252,15 @@ func save_scene(params):
                     print("Absolute file path: " + absolute_path)
                 else:
                     printerr("File reported as saved but does not exist at: " + save_path)
+                    _operation_failed = true
             else:
                 print("Scene saved successfully to: " + save_path)
         else:
             printerr("Failed to save scene: " + str(error))
+            _operation_failed = true
     else:
         printerr("Failed to pack scene (save_scene): " + str(result))
+        _operation_failed = true
 
 # Helper: Convert a JSON value to the correct Godot type based on a node's property type
 func _convert_property_value(node, prop_name, value):
@@ -1895,7 +1906,7 @@ func manage_scene_structure(params):
         _operation_failed = true
         return
 
-    if action == "reorder" or action == "duplicate" or action == "move":
+    if action == "reorder" or action == "duplicate" or action == "move" or action == "rename":
         var loaded_scene = load(full_path)
         if not loaded_scene:
             printerr("Failed to load scene: " + full_path)
@@ -1962,6 +1973,22 @@ func manage_scene_structure(params):
             new_parent.add_child(target, true)
             _set_owner_recursive(target, scene_root)
             print("Node '%s' moved to parent '%s'" % [node_path_str, new_parent_path])
+        elif action == "rename":
+            var new_name = params.get("new_name", "")
+            if new_name.is_empty():
+                printerr("new_name is required for rename")
+                _operation_failed = true
+                return
+            var old_name = target.name
+            # Renaming via the live node tree (instead of a raw text find-replace on the
+            # .tscn) is the same safe pack/repack path reorder/duplicate/move already use —
+            # PackedScene.pack() serializes actual parent= node paths for every descendant,
+            # so children automatically follow. The old text-replace approach renamed EVERY
+            # node sharing that name (no path scoping) and never touched children's
+            # parent="OldName" references, corrupting the scene for any renamed node with
+            # children — Godot's own node.name setter handles uniqueness safely.
+            target.name = new_name
+            print("Node '%s' renamed from '%s' to '%s'" % [node_path_str, old_name, new_name])
 
         var packed_scene = PackedScene.new()
         var result = packed_scene.pack(scene_root)
@@ -1976,30 +2003,8 @@ func manage_scene_structure(params):
             return
         return
 
-    var scene = ResourceLoader.load(full_path) as PackedScene
-    if scene == null:
-        printerr("Failed to load scene: " + full_path)
-        _operation_failed = true
-        return
-
-    var state = scene.get_state()
-    # For simple operations, work with the text file directly
-    var content = FileAccess.get_file_as_string(full_path)
-
-    if action == "rename":
-        var new_name = params.get("new_name", "")
-        if new_name.is_empty():
-            printerr("new_name is required for rename")
-            _operation_failed = true
-            return
-        # Replace node name in tscn file
-        var old_name = node_path_str.get_file()
-        content = content.replace('name="%s"' % old_name, 'name="%s"' % new_name)
-        var file = FileAccess.open(full_path, FileAccess.WRITE)
-        file.store_string(content)
-        file.close()
-        print("Node renamed from '%s' to '%s'" % [old_name, new_name])
-    else:
-        printerr("Unknown manage_scene_structure action: " + action)
-        _operation_failed = true
-        return
+    # rename/reorder/duplicate/move are all handled above via the live node tree — reaching
+    # here means an action this function doesn't recognize.
+    printerr("Unknown manage_scene_structure action: " + action)
+    _operation_failed = true
+    return
