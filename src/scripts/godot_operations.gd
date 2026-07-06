@@ -571,6 +571,14 @@ func add_node(params):
             print("Setting properties on node")
         var properties = params.properties
         for property in properties:
+            # "groups" isn't a real exported property (Node.set("groups", ...) silently
+            # no-ops with no error) — group membership is only settable via add_to_group(), and must pass persistent=true or PackedScene.pack() silently drops it again on save.
+            if property == "groups":
+                for g in properties[property]:
+                    new_node.add_to_group(str(g), true)
+                if debug_mode:
+                    print("Adding to groups: " + str(properties[property]))
+                continue
             # Route through the same type converter modify_node uses — setting raw JSON
             # values directly (a Dictionary for a Vector2/Color, a res:// string or
             # {"type":...} dict for a Resource-typed property) silently no-ops on Godot's
@@ -579,7 +587,7 @@ func add_node(params):
             if debug_mode:
                 print("Setting property: " + property + " = " + str(converted_value) + " (from " + str(properties[property]) + ")")
             new_node.set(property, converted_value)
-    
+
     parent.add_child(new_node)
     new_node.owner = scene_root
     if debug_mode:
@@ -1337,6 +1345,64 @@ func _convert_property_value(node, prop_name, value):
                             Vector2(float(ty.get("x", 0)), float(ty.get("y", 0))),
                             Vector2(float(t_origin.get("x", 0)), float(t_origin.get("y", 0)))
                         )
+                TYPE_PACKED_INT32_ARRAY:
+                    if value is Array:
+                        var arr = PackedInt32Array()
+                        for e in value:
+                            arr.append(int(e))
+                        return arr
+                TYPE_PACKED_INT64_ARRAY:
+                    if value is Array:
+                        var arr = PackedInt64Array()
+                        for e in value:
+                            arr.append(int(e))
+                        return arr
+                TYPE_PACKED_FLOAT32_ARRAY:
+                    if value is Array:
+                        var arr = PackedFloat32Array()
+                        for e in value:
+                            arr.append(float(e))
+                        return arr
+                TYPE_PACKED_FLOAT64_ARRAY:
+                    if value is Array:
+                        var arr = PackedFloat64Array()
+                        for e in value:
+                            arr.append(float(e))
+                        return arr
+                TYPE_PACKED_STRING_ARRAY:
+                    if value is Array:
+                        var arr = PackedStringArray()
+                        for e in value:
+                            arr.append(str(e))
+                        return arr
+                TYPE_PACKED_VECTOR2_ARRAY:
+                    # Polygon2D.polygon/.uv, Line2D.points, CollisionPolygon2D.polygon.
+                    # A JSON array of {x,y} dicts has no matching match-case, so it
+                    # previously fell through to "return value" and set() silently no-op'd
+                    # on the type mismatch — the property stayed at its zeroed default with
+                    # no error (confirmed live: polygon saved as PackedVector2Array(0,0,...)).
+                    if value is Array:
+                        var arr = PackedVector2Array()
+                        for e in value:
+                            if e is Dictionary:
+                                arr.append(Vector2(float(e.get("x", 0)), float(e.get("y", 0))))
+                        return arr
+                TYPE_PACKED_VECTOR3_ARRAY:
+                    if value is Array:
+                        var arr = PackedVector3Array()
+                        for e in value:
+                            if e is Dictionary:
+                                arr.append(Vector3(float(e.get("x", 0)), float(e.get("y", 0)), float(e.get("z", 0))))
+                        return arr
+                TYPE_PACKED_COLOR_ARRAY:
+                    if value is Array:
+                        var arr = PackedColorArray()
+                        for e in value:
+                            if e is Dictionary and e.has("r"):
+                                arr.append(Color(float(e.get("r", 0)), float(e.get("g", 0)), float(e.get("b", 0)), float(e.get("a", 1.0))))
+                            elif e is String and e.begins_with("#"):
+                                arr.append(Color.html(e))
+                        return arr
                 TYPE_BOOL:
                     if value is String:
                         return value.to_lower() == "true"
@@ -1524,6 +1590,13 @@ func modify_node(params):
     var properties = params.properties
     for prop_name in properties:
         var raw_value = properties[prop_name]
+        # "groups" isn't a real exported property (Node.set("groups", ...) silently
+        # no-ops with no error) — group membership is only settable via add_to_group(), and must pass persistent=true or PackedScene.pack() silently drops it again on save.
+        if prop_name == "groups":
+            for g in raw_value:
+                target.add_to_group(str(g), true)
+            log_info("Adding to groups: " + str(raw_value))
+            continue
         var converted_value = _convert_property_value(target, prop_name, raw_value)
         log_info("Setting " + prop_name + " = " + str(converted_value) + " (from " + str(raw_value) + ")")
         target.set(prop_name, converted_value)
@@ -1791,6 +1864,13 @@ func manage_resource(params):
         return
 
 
+func _normalize_signal_node_path(path: String) -> String:
+    if path == "root":
+        return "."
+    if path.begins_with("root/"):
+        return path.substr(5)
+    return path
+
 func manage_scene_signals(params):
     var scene_path = params.get("scene_path", "")
     var action = params.get("action", "list")
@@ -1816,8 +1896,13 @@ func manage_scene_signals(params):
         print("SIGNALS_JSON_END")
     elif action == "add":
         var signal_name = params.get("signal_name", "")
-        var source_path = params.get("source_path", ".")
-        var target_path = params.get("target_path", ".")
+        # The rest of this toolset treats a bare "root" (or a "root/"-prefixed path) as an
+        # alias for the scene's own root node (see add_node/modify_node). But a connection's
+        # from=/to= is a real NodePath resolved relative to the root itself, where the root's
+        # own path is "." — writing the literal string "root" leaves Godot unable to resolve
+        # the NodePath, so the connection silently fails to attach at load time with no error.
+        var source_path = _normalize_signal_node_path(params.get("source_path", "."))
+        var target_path = _normalize_signal_node_path(params.get("target_path", "."))
         var method = params.get("method", "")
         var conn_line = '[connection signal="%s" from="%s" to="%s" method="%s"]' % [signal_name, source_path, target_path, method]
         content += "\n" + conn_line + "\n"

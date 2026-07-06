@@ -31,6 +31,8 @@ import {
   validatePath,
   createErrorResponse,
   isGodot44OrLater,
+  listLayerNames,
+  setLayerNameInProjectGodot,
   type OperationParams,
 } from './utils.js';
 
@@ -2888,7 +2890,7 @@ class GodotServer {
             properties: {
               projectPath: { type: 'string', description: 'Godot project path' },
               action: { type: 'string', description: 'Action: list or set' },
-              layerType: { type: 'string', description: 'Type: render, physics_2d, physics_3d, navigation' },
+              layerType: { type: 'string', description: 'Godot layer category, e.g. 2d_physics, 2d_render, 2d_navigation, avoidance' },
               layer: { type: 'number', description: 'Layer number (1-32)' },
               name: { type: 'string', description: 'Layer name' },
             },
@@ -6300,28 +6302,19 @@ class GodotServer {
     const projectFile = join(args.projectPath, 'project.godot');
     if (!existsSync(projectFile)) return createErrorResponse(`Not a valid Godot project: ${args.projectPath}`);
     try {
-      let content = readFileSync(projectFile, 'utf8');
+      const content = readFileSync(projectFile, 'utf8');
       if (args.action === 'list') {
-        const layerRegex = /layer_names\/([\w_]+)\/layer_(\d+)="([^"]+)"/g;
-        const layers: any[] = [];
-        let match;
-        while ((match = layerRegex.exec(content)) !== null) {
-          layers.push({ type: match[1], layer: parseInt(match[2]), name: match[3] });
-        }
-        return { content: [{ type: 'text', text: JSON.stringify({ layers }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ layers: listLayerNames(content) }, null, 2) }] };
       } else if (args.action === 'set') {
         if (!args.layerType || !args.layer || !args.name) return createErrorResponse('layerType, layer, and name are required for set.');
-        const key = `layer_names/${args.layerType}/layer_${args.layer}`;
-        const settingLine = `${key}="${args.name}"`;
-        const existingRegex = new RegExp(`${key.replace(/\//g, '\\/')}="[^"]*"`);
-        if (existingRegex.test(content)) {
-          content = content.replace(existingRegex, settingLine);
-        } else {
-          if (!content.includes('[layer_names]')) content += '\n[layer_names]\n';
-          content = content.replace('[layer_names]', `[layer_names]\n${settingLine}`);
+        let result;
+        try {
+          result = setLayerNameInProjectGodot(content, args.layerType, args.layer, args.name);
+        } catch (e: any) {
+          return createErrorResponse(e?.message || 'Invalid layer parameters.');
         }
-        writeFileSync(projectFile, content, 'utf8');
-        return { content: [{ type: 'text', text: `Layer set: ${settingLine}` }] };
+        writeFileSync(projectFile, result.content, 'utf8');
+        return { content: [{ type: 'text', text: `Layer set: ${result.line}` }] };
       }
       return createErrorResponse(`Unknown action: ${args.action}`);
     } catch (error: any) {

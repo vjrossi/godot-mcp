@@ -223,6 +223,64 @@ export function createErrorResponse(message: string): any {
   };
 }
 
+// Canonical Godot 4 layer categories (verified against ProjectSettings' own known
+// settings list). Friendly aliases map onto them so callers can pass either form.
+export const LAYER_TYPE_ALIASES: Record<string, string> = {
+  '2d_render': '2d_render', 'render_2d': '2d_render', 'render': '2d_render',
+  '3d_render': '3d_render', 'render_3d': '3d_render',
+  '2d_physics': '2d_physics', 'physics_2d': '2d_physics', 'physics': '2d_physics',
+  '3d_physics': '3d_physics', 'physics_3d': '3d_physics',
+  '2d_navigation': '2d_navigation', 'navigation_2d': '2d_navigation', 'navigation': '2d_navigation', 'nav': '2d_navigation',
+  '3d_navigation': '3d_navigation', 'navigation_3d': '3d_navigation',
+  'avoidance': 'avoidance',
+};
+
+export const VALID_LAYER_TYPES = '2d_render, 3d_render, 2d_physics, 3d_physics, 2d_navigation, 3d_navigation, avoidance';
+
+export function canonicalizeLayerType(layerType: string): string | null {
+  return LAYER_TYPE_ALIASES[String(layerType).toLowerCase()] ?? null;
+}
+
+// Data lines under [layer_names] carry NO "layer_names/" prefix — that's the section
+// name. Godot stores e.g. `2d_physics/layer_1="world"` under `[layer_names]`, which it
+// reads as the setting `layer_names/2d_physics/layer_1`.
+const LAYER_LINE_PATTERN = '^(2d_render|3d_render|2d_physics|3d_physics|2d_navigation|3d_navigation|avoidance)\\/layer_(\\d+)="([^"]+)"';
+
+export function listLayerNames(content: string): Array<{ type: string; layer: number; name: string }> {
+  const re = new RegExp(LAYER_LINE_PATTERN, 'gm');
+  const layers: Array<{ type: string; layer: number; name: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content)) !== null) {
+    layers.push({ type: m[1], layer: parseInt(m[2], 10), name: m[3] });
+  }
+  return layers;
+}
+
+// Pure transform: returns the new project.godot content plus the line written.
+// Throws on an unrecognised layerType so the handler can surface a clear error.
+export function setLayerNameInProjectGodot(
+  content: string,
+  layerType: string,
+  layer: number | string,
+  name: string,
+): { content: string; line: string } {
+  const canon = canonicalizeLayerType(layerType);
+  if (!canon) {
+    throw new Error(`Invalid layerType "${layerType}". Use one of: ${VALID_LAYER_TYPES}.`);
+  }
+  const fileKey = `${canon}/layer_${layer}`;
+  const line = `${fileKey}="${name}"`;
+  const existing = new RegExp(`^${fileKey.replace(/\//g, '\\/')}="[^"]*"`, 'm');
+  let out = content;
+  if (existing.test(out)) {
+    out = out.replace(existing, line);
+  } else {
+    if (!out.includes('[layer_names]')) out += '\n[layer_names]\n';
+    out = out.replace('[layer_names]', `[layer_names]\n${line}`);
+  }
+  return { content: out, line };
+}
+
 export function isGodot44OrLater(version: string): boolean {
   const match = version.match(/^(\d+)\.(\d+)/);
   if (match) {
